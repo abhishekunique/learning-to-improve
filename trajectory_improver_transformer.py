@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Trajectory Improvement using MLP with Noise-Augmented Demonstrations
+Trajectory Improvement using Transformer with Noise-Augmented Demonstrations
 
 This module implements:
 1. Generate optimal demonstrations from 2D pointmass environment
 2. Add increasing noise to create progressively worse demonstrations
-3. Train an MLP to improve trajectories
+3. Train a Transformer to improve trajectories
 4. Implement iterated inference for trajectory improvement
 """
 
@@ -21,6 +21,7 @@ from tqdm import tqdm
 from pointmass_2d import PointMass2DEnv, generate_optimal_demonstrations, visualize_demonstration
 from tensorboardX import SummaryWriter
 from datetime import datetime
+import math
 
 
 def extract_step_features(step: Dict[str, Any]) -> np.ndarray:
@@ -59,6 +60,40 @@ def extract_trajectory_features(trajectory: List[Dict]) -> List[np.ndarray]:
     return [extract_step_features(step) for step in trajectory]
 
 
+class PositionalEncoding(nn.Module):
+    """Positional encoding for transformer."""
+    
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        
+        # Create position encoding matrix
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        # Apply sinusoidal positional encoding
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Add batch dimension and transpose
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        
+        # Register as buffer since it's not a parameter
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        """
+        Add positional encoding to input tensor.
+        
+        Args:
+            x: Input tensor of shape (seq_len, batch_size, d_model)
+            
+        Returns:
+            Tensor with positional encoding added
+        """
+        return x + self.pe[:x.size(0), :]
+
+
 class TrajectoryDataset(Dataset):
     """Dataset for trajectory improvement training."""
     
@@ -73,17 +108,11 @@ class TrajectoryDataset(Dataset):
         
         # Process each trajectory pair
         for bad_traj, good_traj in zip(bad_trajectories, good_trajectories):
-            # Pad shorter trajectory with last state
-            max_len = max(len(bad_traj), len(good_traj))
-            
             # Extract features for entire trajectory
             bad_features = []
             good_features = []
             
-            for i in range(max_len):
-                bad_step = bad_traj[min(i, len(bad_traj) - 1)]
-                good_step = good_traj[min(i, len(good_traj) - 1)]
-                
+            for bad_step, good_step in zip(bad_traj, good_traj):
                 # Extract features using the utility function
                 bad_step_features = extract_step_features(bad_step)
                 good_step_features = extract_step_features(good_step)
@@ -91,39 +120,58 @@ class TrajectoryDataset(Dataset):
                 bad_features.append(bad_step_features)
                 good_features.append(good_step_features)
             
-            # Store flattened trajectory features
-            # Flatten features into single vector for each trajectory
-            flattened_bad = np.array(bad_features).flatten()
-            flattened_good = np.array(good_features).flatten()
-            self.bad_trajectories.append(flattened_bad)
-            self.good_trajectories.append(flattened_good)
+            # Store as sequence of features
+            self.bad_trajectories.append(np.array(bad_features))
+            self.good_trajectories.append(np.array(good_features))
     
     def __len__(self):
         return len(self.bad_trajectories)
     
     def __getitem__(self, idx):
         return (
-            torch.FloatTensor(self.bad_trajectories[idx]),
-            torch.FloatTensor(self.good_trajectories[idx])
+            torch.FloatTensor(self.bad_trajectories[idx]),  # Shape: (seq_len, 7)
+            torch.FloatTensor(self.good_trajectories[idx])  # Shape: (seq_len, 7)
         )
 
 
-class TrajectoryImproverMLP(nn.Module):
-    """MLP model for improving trajectories."""
+class TrajectoryImproverTransformer(nn.Module):
+    """Transformer model for improving trajectories."""
     
-    def __init__(self, input_dim: int = 140, hidden_dim: int = 128, output_dim: int = 140, num_layers: int = 4):
+    def __init__(self, 
+                 feature_dim: int = 7,
+                 d_model: int = 128,
+                 nhead: int = 8,
+                 num_layers: int = 6,
+                 dim_feedforward: int = 512,
+                 dropout: float = 0.1,
+                 max_length: int = 20):
         super().__init__()
         
-        # Build network layers dynamically
-        layers = []
-        layer_sizes = [input_dim] + [hidden_dim] * num_layers + [output_dim]
+        self.feature_dim = feature_dim
+        self.d_model = d_model
+        self.max_length = max_length
         
-        for i in range(len(layer_sizes)-1):
-            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
-            if i < len(layer_sizes)-2:  # Don't add activation after last layer
-                layers.append(nn.ReLU())
+        # Input projection to transformer dimension
+        self.input_projection = nn.Linear(feature_dim, d_model)
         
-        self.network = nn.Sequential(*layers)
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, max_length)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers
+        )
+        
+        # Output projection back to feature dimension
+        self.output_projection = nn.Linear(d_model, feature_dim)
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -135,7 +183,23 @@ class TrajectoryImproverMLP(nn.Module):
                 torch.nn.init.zeros_(module.bias)
     
     def forward(self, x):
-        return self.network(x)
+        # x shape: (batch_size, seq_len, feature_dim)
+        
+        # Project to transformer dimension
+        x = self.input_projection(x)  # (batch_size, seq_len, d_model)
+        
+        # Add positional encoding
+        x = x.transpose(0, 1)  # (seq_len, batch_size, d_model)
+        x = self.pos_encoder(x)
+        x = x.transpose(0, 1)  # (batch_size, seq_len, d_model)
+        
+        # Pass through transformer encoder
+        x = self.transformer_encoder(x)  # (batch_size, seq_len, d_model)
+        
+        # Project back to feature dimension
+        output = self.output_projection(x)  # (batch_size, seq_len, feature_dim)
+        
+        return output
 
 
 def add_noise_to_trajectory(trajectory: List[Dict], noise_level: float, max_episode_length: int = 20) -> List[Dict]:
@@ -161,7 +225,6 @@ def add_noise_to_trajectory(trajectory: List[Dict], noise_level: float, max_epis
     env.goal = noisy_goal
     
     # Generate optimal trajectory to noisy goal
-    # env.goal = goal
     noisy_trajectory = generate_optimal_demonstrations(env, target=noisy_goal, num_demos=1, max_episode_length=max_episode_length)[0]
     
     # Replace noisy goal with original goal in observations
@@ -226,9 +289,9 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
                              epochs: int = 100,
                              batch_size: int = 32,
                              learning_rate: float = 1e-3,
-                             writer: SummaryWriter = None) -> TrajectoryImproverMLP:
+                             writer: SummaryWriter = None) -> TrajectoryImproverTransformer:
     """
-    Train the trajectory improvement MLP.
+    Train the trajectory improvement Transformer.
     
     Args:
         bad_trajectories: List of noisy/bad trajectory demonstrations
@@ -239,7 +302,7 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
         writer: TensorboardX SummaryWriter for logging
     
     Returns:
-        Trained TrajectoryImproverMLP model
+        Trained TrajectoryImproverTransformer model
     """
     # Create random indices for shuffling
     num_trajectories = len(bad_trajectories)
@@ -263,11 +326,19 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     # Initialize model
-    model = TrajectoryImproverMLP()
+    model = TrajectoryImproverTransformer(
+        feature_dim=7,
+        d_model=128,
+        nhead=8,
+        num_layers=6,
+        dim_feedforward=512,
+        dropout=0.1,
+        max_length=20
+    )
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
-    print(f"Training trajectory improver for {epochs} epochs...")
+    print(f"Training trajectory improver transformer for {epochs} epochs...")
     print(f"Training set size: {len(train_dataset)}, Validation set size: {len(val_dataset)}")
     
     best_val_loss = float('inf')
@@ -286,6 +357,7 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
         for batch_idx, (batch_bad, batch_good) in enumerate(batch_pbar):
             optimizer.zero_grad()
             
+            # batch_bad and batch_good shape: (batch_size, seq_len, feature_dim)
             predicted_good = model(batch_bad)
             loss = criterion(predicted_good, batch_good)
             
@@ -351,10 +423,10 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
     return model
 
 
-def improve_trajectory(model: TrajectoryImproverMLP, 
+def improve_trajectory(model: TrajectoryImproverTransformer, 
                       trajectory: List[Dict]) -> List[Dict]:
     """
-    Improve a single trajectory using the trained model.
+    Improve a single trajectory using the trained transformer model.
     
     Args:
         model: Trained trajectory improvement model
@@ -367,14 +439,14 @@ def improve_trajectory(model: TrajectoryImproverMLP,
     improved_trajectory = []
     
     with torch.no_grad():
-        # Extract features for entire trajectory at once
+        # Extract features for entire trajectory
         features_list = extract_trajectory_features(trajectory)
-            
-        # Stack features into batch tensor
-        input_tensor = torch.FloatTensor(np.stack(features_list)).view(1, -1) # Add batch dimension of size 1
         
-        # Get model predictions for entire trajectory
-        predicted_features = model(input_tensor).detach().numpy().reshape(-1, 7)
+        # Convert to tensor and add batch dimension
+        input_tensor = torch.FloatTensor(np.stack(features_list)).unsqueeze(0)  # (1, seq_len, feature_dim)
+        
+        # Get model predictions
+        predicted_features = model(input_tensor).squeeze(0).detach().numpy()  # (seq_len, feature_dim)
         
         # Create improved trajectory
         for i, step in enumerate(trajectory):
@@ -387,10 +459,10 @@ def improve_trajectory(model: TrajectoryImproverMLP,
     return improved_trajectory
 
 
-def iterated_inference(model: TrajectoryImproverMLP, 
+def iterated_inference(model: TrajectoryImproverTransformer, 
                       trajectory: List[Dict], 
                       num_iterations: int = 5,
-                      convergence_threshold: float = 1e-4) -> List[Dict]:
+                      convergence_threshold: float = 1e-4) -> Tuple[List[Dict], List[List[Dict]]]:
     """
     Apply iterated inference to progressively improve a trajectory.
     
@@ -401,7 +473,7 @@ def iterated_inference(model: TrajectoryImproverMLP,
         convergence_threshold: Threshold for convergence detection
     
     Returns:
-        Progressively improved trajectory
+        Tuple of (final_improved_trajectory, list_of_all_trajectories)
     """
     trajectory_list = [trajectory.copy()]
     current_trajectory = trajectory.copy()
@@ -553,6 +625,7 @@ def visualize_trajectory_comparison(env: PointMass2DEnv,
     
     plt.show()
 
+
 def visualize_training_data(env: PointMass2DEnv,
                           bad_trajectories: List[List[Dict]], 
                           good_trajectories: List[List[Dict]], 
@@ -632,10 +705,11 @@ def visualize_training_data(env: PointMass2DEnv,
     if save_path:
         plt.savefig(save_path)
     
-    plt.savefig('trajectory_comparison.png')
+    plt.savefig('trajectory_comparison_transformer.png')
+
 
 def main():
-    """Main function to demonstrate trajectory improvement."""
+    """Main function to demonstrate transformer-based trajectory improvement."""
     
     # Create environment
     print("Creating 2D Point Mass Environment...")
@@ -644,7 +718,7 @@ def main():
     # Generate training data
     print("\n=== Generating Training Data ===")
     bad_trajectories, good_trajectories = generate_noise_augmented_data(
-        env, num_optimal_demos=100, noise_levels=[0.2, 0.4, 0.6, 0.8, 1.0]
+        env, num_optimal_demos=300, noise_levels=[0.2, 0.4, 0.6, 0.8, 1.0]
     )
     assert len(bad_trajectories) == len(good_trajectories), "Bad and good trajectory lists must have same length"
     for bad_traj, good_traj in zip(bad_trajectories, good_trajectories):
@@ -653,19 +727,20 @@ def main():
     visualize_training_data(env, bad_trajectories, good_trajectories)
 
     # Train the trajectory improver
-    print("\n=== Training Trajectory Improver ===")
+    print("\n=== Training Trajectory Improver Transformer ===")
     from tensorboardX import SummaryWriter
-    writer = SummaryWriter(f'runs/trajectory_improver_{datetime.now().strftime("%Y%m%d")}')
+    writer = SummaryWriter(f'runs/trajectory_improver_transformer_{datetime.now().strftime("%Y%m%d")}')
+    
     # Try to load existing model first
-    model_path = 'models/trajectory_improver.pt'
+    model_path = 'trajectory_improver_transformer.pt'
     if os.path.exists(model_path):
         print(f"Loading existing model from {model_path}")
         model = torch.load(model_path)
     else:
-        print("Training new model...")
+        print("Training new transformer model...")
         model = train_trajectory_improver(
             bad_trajectories, good_trajectories, 
-            epochs=2000, batch_size=128, learning_rate=1e-3,
+            epochs=400, batch_size=128, learning_rate=1e-4,
             writer=writer
         )
         # Save the trained model
@@ -678,9 +753,8 @@ def main():
     print("\n=== Testing Trajectory Improvement ===")
     
     # Generate a new optimal demo
-    optimal_demo = generate_optimal_demonstrations(env, target=np.array([3.5, 3.5]), num_demos=1, max_episode_length=20)[0]
+    optimal_demo = generate_optimal_demonstrations(env, num_demos=1, max_episode_length=20)[0]
     
-    # import IPython; IPython.embed()
     # Create a noisy version
     noisy_demo = add_noise_to_trajectory(optimal_demo, noise_level=1.5)
     
@@ -697,7 +771,7 @@ def main():
     
     # Visualize comparison
     print("\n=== Visualizing Results ===")
-    visualize_trajectory_comparison(env, noisy_demo, improved_demo, trajectory_list, save_path='plots/trajectory_comparison_improvement.png')
+    visualize_trajectory_comparison(env, noisy_demo, improved_demo, trajectory_list, save_path='plots/trajectory_comparison_transformer.png')
     
     # Test with a completely random trajectory
     print("\n=== Testing with Random Trajectory ===")
@@ -725,10 +799,10 @@ def main():
     print(f"Improved random trajectory quality: {improved_random_quality}")
     
     # Visualize random trajectory improvement
-    visualize_trajectory_comparison(env, random_trajectory, improved_random, trajectory_list, save_path='plots/random_trajectory_improvement.png')
+    visualize_trajectory_comparison(env, random_trajectory, improved_random, trajectory_list, save_path='plots/random_trajectory_improvement_transformer.png')
     
     env.close()
-    print("\nDemonstration completed!")
+    print("\nTransformer-based demonstration completed!")
 
 
 if __name__ == "__main__":

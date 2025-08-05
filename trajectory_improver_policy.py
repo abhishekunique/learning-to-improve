@@ -718,7 +718,7 @@ def main():
     from tensorboardX import SummaryWriter
     writer = SummaryWriter(f'runs/trajectory_improver_policy_{datetime.now().strftime("%Y%m%d")}')
     # Try to load existing model first
-    model_path = 'trajectory_improver_policy.pt'
+    model_path = 'models/trajectory_improver_policy.pt'
     if model_path is not None and os.path.exists(model_path):
         print(f"Loading existing model from {model_path}")
         model = torch.load(model_path)

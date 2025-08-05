@@ -1,0 +1,4 @@
+models/
+plots/
+runs/
+*pycache*

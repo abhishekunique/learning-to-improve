@@ -2,3 +2,4 @@ models/
 plots/
 runs/
 *pycache*
+*.png

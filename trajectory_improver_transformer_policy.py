@@ -837,7 +837,7 @@ def main():
     optimal_demo = generate_optimal_demonstrations(env, num_demos=1, max_episode_length=20)[0]
     
     # Create a noisy version
-    noisy_demo = add_noise_to_trajectory(optimal_demo, noise_level=0.8)
+    noisy_demo = add_noise_to_trajectory(optimal_demo, noise_level=1.5)
     
     # Evaluate original noisy trajectory
     original_quality = evaluate_trajectory_quality(noisy_demo, env)

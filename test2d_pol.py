@@ -102,7 +102,7 @@ class TrajectoryDataset(Dataset):
     """Dataset for trajectory improvement training with context-based action prediction."""
     
     def __init__(self, bad_trajectories: List[List[Dict]], good_trajectories: List[List[Dict]], 
-                 context_length: int = 50, num_samples_per_traj: int = 5):
+                 context_length: int = 100, num_samples_per_traj: int = 5):
         """
         Args:
             bad_trajectories: List of noisy/bad trajectory demonstrations
@@ -254,7 +254,7 @@ class TrajectoryImproverTransformer(nn.Module):
         return action 
 
 
-def add_noise_to_trajectory(env, env_name, trajectory: List[Dict], noise_level: float, max_episode_length: int = 50) -> List[Dict]:
+def add_noise_to_trajectory(env, env_name, trajectory: List[Dict], noise_level: float, max_episode_length: int = 100) -> List[Dict]:
     """
     Add noise to a trajectory to create a worse version.
     
@@ -266,7 +266,7 @@ def add_noise_to_trajectory(env, env_name, trajectory: List[Dict], noise_level: 
         Noisy trajectory
     """
     # Extract goal from first step of trajectory
-    original_goal = trajectory[0]['obs'][3:6]
+    original_goal = copy.deepcopy(trajectory[0]['obs'][3:6])
     
     # Add noise to goal
     goal_noise = np.random.uniform(-noise_level, noise_level, 3)
@@ -280,7 +280,7 @@ def add_noise_to_trajectory(env, env_name, trajectory: List[Dict], noise_level: 
 def generate_noise_augmented_data(env, env_name: str,
                                  num_optimal_demos: int = 50,
                                  noise_levels: List[float] = None,
-                                 max_episode_length: int = 50) -> Tuple[List, List]:
+                                 max_episode_length: int = 100) -> Tuple[List, List]:
     """
     Generate optimal demonstrations and create noisy versions for training.
     
@@ -297,7 +297,15 @@ def generate_noise_augmented_data(env, env_name: str,
         noise_levels = [0.1, 0.2, 0.3, 0.4, 0.5]
     
     print(f"Generating {num_optimal_demos} optimal demonstrations...")
-    optimal_demos = [get_expert_trajectory(env, env_name, max_traj_len=max_episode_length) for _ in range(num_optimal_demos)]
+    low_val = np.array([-0.09440674, 0.8])
+    high_val = np.array([0.09411726, 0.9])
+    optimal_demos = []
+    
+    # Generating goals in the plane
+    for _ in range(num_optimal_demos):
+        goal_pos = np.concatenate([np.random.uniform(low_val, high_val), np.array([0.14507392])])
+        traj = get_expert_trajectory(env, env_name, max_traj_len=max_episode_length, goal_pos=goal_pos)
+        optimal_demos.append(traj)
     
     bad_trajectories = []
     good_trajectories = []
@@ -327,8 +335,27 @@ def generate_noise_augmented_data(env, env_name: str,
         # Add final pair where both good and bad are noise-free (end of improvement chain)
         bad_trajectories.append(demo)  # Noise-free bad trajectory
         good_trajectories.append(demo)  # Noise-free good trajectory (same as bad)
-
+    
     print(f"Generated {len(bad_trajectories)} bad trajectories and {len(good_trajectories)} good trajectories")
+    
+    print("trajectory viz")
+    
+    plt.cla()
+    plt.clf()
+    for traj in bad_trajectories:
+        obs_list = np.array([ts['obs'] for ts in traj])
+        plt.plot(obs_list[:, 0], obs_list[:, 1])
+        plt.scatter(obs_list[-1, -3], obs_list[-1, -2], marker='x')
+    plt.savefig('test_data_bad.png')
+
+    plt.cla()
+    plt.clf()
+    for traj in good_trajectories:
+        obs_list = np.array([ts['obs'] for ts in traj])
+        plt.plot(obs_list[:, 0], obs_list[:, 1])
+        plt.scatter(obs_list[-1, -3], obs_list[-1, -2], marker='x')
+    plt.savefig('test_data_good.png')
+    
     return bad_trajectories, good_trajectories 
 
 
@@ -338,7 +365,7 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
                              batch_size: int = 32,
                              learning_rate: float = 1e-3,
                              writer: SummaryWriter = None,
-                             context_length: int = 50,
+                             context_length: int = 100,
                              num_samples_per_traj: int = 5,
                              model: TrajectoryImproverTransformer = None) -> TrajectoryImproverTransformer:
     """
@@ -486,7 +513,7 @@ def train_trajectory_improver(bad_trajectories: List[List[Dict]],
 
 def improve_trajectory(model: TrajectoryImproverTransformer, 
                       trajectory: List[Dict],
-                      context_length: int = 50,
+                      context_length: int = 100,
                       env = None) -> List[Dict]:
     """
     Improve a single trajectory using the trained transformer policy with closed-loop execution.
@@ -505,7 +532,6 @@ def improve_trajectory(model: TrajectoryImproverTransformer,
     
     # Reset environment to initial state
     obs, info = env.reset()
-    # import IPython; IPython.embed() # Make sure size is correct
     goal = trajectory[0]['obs'][-3:].copy()
 
     # Setting the environment goal
@@ -570,7 +596,7 @@ def iterated_inference(model: TrajectoryImproverTransformer,
     
     for iteration in range(num_iterations):
         # Improve trajectory
-        improved_trajectory = improve_trajectory(model, current_trajectory, context_length=50, env=env)
+        improved_trajectory = improve_trajectory(model, current_trajectory, context_length=100, env=env)
         
         # Check convergence
         if previous_trajectory is not None:
@@ -592,7 +618,6 @@ def iterated_inference(model: TrajectoryImproverTransformer,
         previous_trajectory = copy.deepcopy(current_trajectory)
         current_trajectory = copy.deepcopy(improved_trajectory)
         trajectory_list.append(current_trajectory.copy())
-        import IPython; IPython.embed()
     # import pdb; pdb.set_trace()
     return current_trajectory, trajectory_list
 
@@ -639,63 +664,59 @@ def visualize_trajectory_comparison(env,
                                   overall_maxs: np.ndarray,
                                   save_path: str = None):
     """
-    Visualize comparison between original and improved trajectories in 3D.
+    Visualize comparison between original and improved trajectories in 2D.
     
     Args:
         env: The environment
         original_trajectory: Original trajectory
         improved_trajectory: Improved trajectory
         trajectory_list: List of intermediate trajectories
-        overall_mins: Minimum bounds for 3D plot
-        overall_maxs: Maximum bounds for 3D plot
+        overall_mins: Minimum bounds for 2D plot
+        overall_maxs: Maximum bounds for 2D plot
         save_path: Optional path to save visualization
     """
-    from mpl_toolkits.mplot3d import Axes3D
     
     fig = plt.figure(figsize=(20, 8))
     
-    # Create 3D subplots
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax2 = fig.add_subplot(122, projection='3d')
+    # Create 2D subplots
+    ax1 = fig.add_subplot(121)
+    ax2 = fig.add_subplot(122)
     
-    # Plot original trajectory in 3D
-    ax1.set_title("Original Trajectory (3D)", fontsize=14)
+    # Plot original trajectory in 2D
+    ax1.set_title("Original Trajectory (2D)", fontsize=14)
     ax1.set_xlim(overall_mins[0], overall_maxs[0])
     ax1.set_ylim(overall_mins[1], overall_maxs[1])
-    ax1.set_zlim(overall_mins[2], overall_maxs[2])
     ax1.grid(True, alpha=0.3)
     
-    # Extract 3D positions (x, y, z)
-    positions_3d = []
+    # Extract 2D positions (x, y) - dropping z dimension
+    positions_2d = []
     for i, step in enumerate(original_trajectory):
-        pos_3d = step['obs'][:3]  # Get x, y, z position
-        positions_3d.append([pos_3d[0], pos_3d[1], pos_3d[2]])
+        pos_2d = step['obs'][:2]  # Get x, y position only
+        positions_2d.append([pos_2d[0], pos_2d[1]])
     
-    positions_3d = np.array(positions_3d)
+    positions_2d = np.array(positions_2d)
     
-    # Plot 3D trajectory
-    ax1.plot(positions_3d[:, 0], positions_3d[:, 1], positions_3d[:, 2], 
+    # Plot 2D trajectory
+    ax1.plot(positions_2d[:, 0], positions_2d[:, 1], 
              'b-', alpha=0.8, linewidth=3, label='Trajectory')
     
     # Plot start and end points
-    ax1.scatter(positions_3d[0, 0], positions_3d[0, 1], positions_3d[0, 2], 
+    ax1.scatter(positions_2d[0, 0], positions_2d[0, 1], 
                 c='green', s=200, label='Start', marker='o')
-    ax1.scatter(positions_3d[-1, 0], positions_3d[-1, 1], positions_3d[-1, 2], 
+    ax1.scatter(positions_2d[-1, 0], positions_2d[-1, 1], 
                 c='red', s=200, label='End', marker='o')
     
-    # Plot goal in 3D
-    goal = original_trajectory[0]['obs'][3:6]
-    ax1.scatter(goal[0], goal[1], goal[2], c='orange', s=200, label='Goal', marker='*')
+    # Plot goal in 2D
+    goal = original_trajectory[0]['obs'][3:5]  # Only x, y coordinates of goal
+    ax1.scatter(goal[0], goal[1], c='orange', s=200, label='Goal', marker='*')
     ax1.set_xlabel('X Position')
     ax1.set_ylabel('Y Position')
-    ax1.set_zlabel('Z Position')
     ax1.legend()
     
-    # Plot improved trajectory and intermediates in 3D
-    ax2.set_title("Improvement Process (3D)", fontsize=14)
+    # Plot improved trajectory and intermediates in 2D
+    ax2.set_title("Improvement Process (2D)", fontsize=14)
     ax2.set_xlim(overall_mins[0], overall_maxs[0])
     ax2.set_ylim(overall_mins[1], overall_maxs[1])
-    ax2.set_zlim(overall_mins[2], overall_maxs[2])
     ax2.grid(True, alpha=0.3)
     
     # Create color map for trajectory evolution
@@ -703,34 +724,33 @@ def visualize_trajectory_comparison(env,
     
     # Plot intermediate trajectories with color gradient
     for i, (traj, color) in enumerate(zip(trajectory_list, colors)):
-        positions_3d = []
+        positions_2d = []
         for j, step in enumerate(traj):
-            pos_3d = step['obs'][:3]
-            positions_3d.append([pos_3d[0], pos_3d[1], pos_3d[2]])
+            pos_2d = step['obs'][:2]  # Only x, y coordinates
+            positions_2d.append([pos_2d[0], pos_2d[1]])
         
-        positions_3d = np.array(positions_3d)
+        positions_2d = np.array(positions_2d)
         label = f'Iteration {i}'
-        ax2.plot(positions_3d[:, 0], positions_3d[:, 1], positions_3d[:, 2], 
+        ax2.plot(positions_2d[:, 0], positions_2d[:, 1], 
                 '-', color=color, alpha=0.6, linewidth=2, label=label)
     
     # Plot start and end points of final improved trajectory
-    final_positions_3d = []
+    final_positions_2d = []
     for i, step in enumerate(improved_trajectory):
-        pos_3d = step['obs'][:3]
-        final_positions_3d.append([pos_3d[0], pos_3d[1], pos_3d[2]])
+        pos_2d = step['obs'][:2]  # Only x, y coordinates
+        final_positions_2d.append([pos_2d[0], pos_2d[1]])
     
-    final_positions_3d = np.array(final_positions_3d)
-    ax2.scatter(final_positions_3d[0, 0], final_positions_3d[0, 1], final_positions_3d[0, 2], 
+    final_positions_2d = np.array(final_positions_2d)
+    ax2.scatter(final_positions_2d[0, 0], final_positions_2d[0, 1], 
                 c='green', s=200, label='Start', marker='o')
-    ax2.scatter(final_positions_3d[-1, 0], final_positions_3d[-1, 1], final_positions_3d[-1, 2], 
+    ax2.scatter(final_positions_2d[-1, 0], final_positions_2d[-1, 1], 
                 c='red', s=200, label='End', marker='o')
     
-    # Plot goal in 3D
-    goal = improved_trajectory[0]['obs'][3:6]
-    ax2.scatter(goal[0], goal[1], goal[2], c='orange', s=200, label='Goal', marker='*')
+    # Plot goal in 2D
+    goal = improved_trajectory[0]['obs'][3:5]  # Only x, y coordinates of goal
+    ax2.scatter(goal[0], goal[1], c='orange', s=200, label='Goal', marker='*')
     ax2.set_xlabel('X Position')
     ax2.set_ylabel('Y Position')
-    ax2.set_zlabel('Z Position')
     ax2.legend()
     
     plt.tight_layout()
@@ -749,22 +769,21 @@ def visualize_training_data(env,
                           num_samples: int = 5,
                           save_path: str = None):
     """
-    Visualize a sample of training data showing bad and good trajectory pairs in 3D.
+    Visualize a sample of training data showing bad and good trajectory pairs in 2D.
     
     Args:
         env: The environment
         bad_trajectories: List of noisy/bad trajectories
         good_trajectories: List of corresponding optimal trajectories 
-        overall_mins: Minimum bounds for 3D plot
-        overall_maxs: Maximum bounds for 3D plot
+        overall_mins: Minimum bounds for 2D plot
+        overall_maxs: Maximum bounds for 2D plot
         num_samples: Number of trajectory pairs to visualize
         save_path: Optional path to save the visualization
     """
-    from mpl_toolkits.mplot3d import Axes3D
     
-    # Create figure with 3D subplots
+    # Create figure with 2D subplots
     fig = plt.figure(figsize=(20, 4*num_samples))
-    fig.suptitle("Training Data: Bad vs Good Trajectories (3D)", fontsize=16)
+    fig.suptitle("Training Data: Bad vs Good Trajectories (2D)", fontsize=16)
     
     # Randomly sample trajectory pairs
     indices = np.random.choice(len(bad_trajectories), num_samples, replace=False)
@@ -773,83 +792,79 @@ def visualize_training_data(env,
         bad_traj = bad_trajectories[idx]
         good_traj = good_trajectories[idx]
         
-        # Create 3D subplots for this pair
-        ax1 = fig.add_subplot(num_samples, 2, 2*i + 1, projection='3d')
-        ax2 = fig.add_subplot(num_samples, 2, 2*i + 2, projection='3d')
+        # Create 2D subplots for this pair
+        ax1 = fig.add_subplot(num_samples, 2, 2*i + 1)
+        ax2 = fig.add_subplot(num_samples, 2, 2*i + 2)
         
-        # Plot bad trajectory in 3D
-        ax1.set_title(f"Bad Trajectory {i+1} (3D)", fontsize=12)
+        # Plot bad trajectory in 2D
+        ax1.set_title(f"Bad Trajectory {i+1} (2D)", fontsize=12)
         ax1.set_xlim(overall_mins[0], overall_maxs[0])
         ax1.set_ylim(overall_mins[1], overall_maxs[1])
-        ax1.set_zlim(overall_mins[2], overall_maxs[2])
         ax1.grid(True, alpha=0.3)
         
-        # Extract 3D positions for bad trajectory
-        bad_positions_3d = []
+        # Extract 2D positions for bad trajectory
+        bad_positions_2d = []
         for step in bad_traj:
-            pos_3d = step['obs'][:3]  # Already 3D coordinates
-            bad_positions_3d.append(pos_3d)
+            pos_2d = step['obs'][:2]  # Only x, y coordinates
+            bad_positions_2d.append(pos_2d)
         
-        bad_positions_3d = np.array(bad_positions_3d)
+        bad_positions_2d = np.array(bad_positions_2d)
         
-        # Plot 3D trajectory
-        ax1.plot(bad_positions_3d[:, 0], bad_positions_3d[:, 1], bad_positions_3d[:, 2], 
+        # Plot 2D trajectory
+        ax1.plot(bad_positions_2d[:, 0], bad_positions_2d[:, 1], 
                  'r-', alpha=0.8, linewidth=3, label='Bad Trajectory')
         
         # Plot start and end points
-        ax1.scatter(bad_positions_3d[0, 0], bad_positions_3d[0, 1], bad_positions_3d[0, 2], 
+        ax1.scatter(bad_positions_2d[0, 0], bad_positions_2d[0, 1], 
                     c='green', s=150, label='Start', marker='o')
-        ax1.scatter(bad_positions_3d[-1, 0], bad_positions_3d[-1, 1], bad_positions_3d[-1, 2], 
+        ax1.scatter(bad_positions_2d[-1, 0], bad_positions_2d[-1, 1], 
                     c='red', s=150, label='End', marker='o')
         
-        # Plot goal in 3D
-        goal = bad_traj[0]['obs'][3:6]  # 3D goal
-        ax1.scatter(goal[0], goal[1], goal[2], 
+        # Plot goal in 2D
+        goal = bad_traj[0]['obs'][3:5]  # Only x, y coordinates of goal
+        ax1.scatter(goal[0], goal[1], 
                    c='orange', s=150, label='Goal', marker='*')
         
         ax1.set_xlabel('X Position')
         ax1.set_ylabel('Y Position')
-        ax1.set_zlabel('Z Position')
         ax1.legend()
         
-        # Plot good trajectory in 3D
-        ax2.set_title(f"Good Trajectory {i+1} (3D)", fontsize=12)
+        # Plot good trajectory in 2D
+        ax2.set_title(f"Good Trajectory {i+1} (2D)", fontsize=12)
         ax2.set_xlim(overall_mins[0], overall_maxs[0])
         ax2.set_ylim(overall_mins[1], overall_maxs[1])
-        ax2.set_zlim(overall_mins[2], overall_maxs[2])
         ax2.grid(True, alpha=0.3)
         
-        # Extract 3D positions for good trajectory
-        good_positions_3d = []
+        # Extract 2D positions for good trajectory
+        good_positions_2d = []
         for step in good_traj:
-            pos_3d = step['obs'][:3]  # Already 3D coordinates
-            good_positions_3d.append(pos_3d)
+            pos_2d = step['obs'][:2]  # Only x, y coordinates
+            good_positions_2d.append(pos_2d)
         
-        good_positions_3d = np.array(good_positions_3d)
+        good_positions_2d = np.array(good_positions_2d)
         
-        # Plot 3D trajectory
-        ax2.plot(good_positions_3d[:, 0], good_positions_3d[:, 1], good_positions_3d[:, 2], 
+        # Plot 2D trajectory
+        ax2.plot(good_positions_2d[:, 0], good_positions_2d[:, 1], 
                  'b-', alpha=0.8, linewidth=3, label='Good Trajectory')
         
         # Plot start and end points
-        ax2.scatter(good_positions_3d[0, 0], good_positions_3d[0, 1], good_positions_3d[0, 2], 
+        ax2.scatter(good_positions_2d[0, 0], good_positions_2d[0, 1], 
                     c='green', s=150, label='Start', marker='o')
-        ax2.scatter(good_positions_3d[-1, 0], good_positions_3d[-1, 1], good_positions_3d[-1, 2], 
+        ax2.scatter(good_positions_2d[-1, 0], good_positions_2d[-1, 1], 
                     c='red', s=150, label='End', marker='o')
         
-        # Plot goal in 3D
-        goal = good_traj[0]['obs'][3:6]  # 3D goal
-        ax2.scatter(goal[0], goal[1], goal[2],
+        # Plot goal in 2D
+        goal = good_traj[0]['obs'][3:5]  # Only x, y coordinates of goal
+        ax2.scatter(goal[0], goal[1],
                    c='orange', s=150, label='Goal', marker='*')
         
         ax2.set_xlabel('X Position')
         ax2.set_ylabel('Y Position')
-        ax2.set_zlabel('Z Position')
         ax2.legend()
     
     plt.tight_layout()
 
-    plt.savefig('trajectory_comparison_transformer_policy.png') 
+    plt.savefig('training_data_viz.png') 
 
 
 def main():
@@ -858,7 +873,7 @@ def main():
     # Create environment
     print("Creating Reaching Environment...")
     env_name = "reach-v3"
-    max_traj_len = 50
+    max_traj_len = 100
     env = gym.make("Meta-World/MT1", env_name=env_name, render_mode="rgb_array")
     
     # Generate training data
@@ -903,7 +918,7 @@ def main():
     writer = SummaryWriter(f'runs/trajectory_improver_transformer_policy_metaworld_{datetime.now().strftime("%Y%m%d")}')
     
     # Try to load existing model first
-    model_path = 'models/trajectory_improver_transformer_policy_metaworld.pt'
+    model_path = 'models/trajectory_improver_transformer_policy_metaworld_2d.pt'
     load_model = False
     train_model = False
     if load_model and os.path.exists(model_path):
@@ -913,7 +928,7 @@ def main():
             model = train_trajectory_improver(
                 bad_trajectories, good_trajectories, 
                 epochs=100, batch_size=128, learning_rate=1e-3,
-                writer=writer, context_length=50, num_samples_per_traj=10,
+                writer=writer, context_length=100, num_samples_per_traj=10,
                 model=model
             )
         else:
@@ -923,7 +938,7 @@ def main():
         model = train_trajectory_improver(
             bad_trajectories, good_trajectories, 
             epochs=100, batch_size=128, learning_rate=1e-3,
-            writer=writer, context_length=50, num_samples_per_traj=10
+            writer=writer, context_length=100, num_samples_per_traj=10
         )
         # Save the trained model
         print(f"Saving model to {model_path}")

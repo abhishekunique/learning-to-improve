@@ -5,11 +5,12 @@ import gymnasium as gym
 from metaworld.policies import ENV_POLICY_MAP
 import skvideo.io
 import numpy as np
+import copy
 
 def obs_processor(obs, overwrite_goal=None):
     oc = np.concatenate([obs[:3], obs[-3:]])
     if overwrite_goal is not None:
-        oc[-3:] = overwrite_goal
+        oc[-3:] = copy.deepcopy(overwrite_goal)
     return oc
 
 def get_expert_trajectory(env, env_name, goal_pos=None, max_traj_len=200, overwrite_goal=None, random_actions=False):
